@@ -420,6 +420,9 @@ body {
     -webkit-animation: gwd-gen-1qe2gwdanimation_gwd-keyframes 0.5s linear 0s 1 normal forwards;
     -moz-animation: gwd-gen-1qe2gwdanimation_gwd-keyframes 0.5s linear 0s 1 normal forwards;
 }
+p.gwd-grp-1009 {
+    font-weight: bold;
+}
 [data-gwd-group="G_POLICY"] .gwd-grp-1009.gwd-path-128s {
     position: absolute;
     stroke-width: 1px;
