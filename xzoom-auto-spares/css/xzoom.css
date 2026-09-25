@@ -135,3 +135,10 @@ img#xzoom-fancy {
     padding-top: 10px;
     padding-left: 20px;
 }
+.seller-feedback {
+    max-width: 740px;
+    margin: 1.5rem auto;
+    padding: 0 1rem;
+    font-family: Arial, sans-serif;
+    line-height: 1.5;
+}

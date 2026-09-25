@@ -166,6 +166,11 @@ a {
     content: normal; }
 .main-content ul, .main-content ol {
   margin-top: 0; }
+.demo-list li {
+  margin-bottom: 0.75rem; }
+.demo-list a:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px; }
 .main-content blockquote {
   padding: 0 1rem;
   margin-left: 0;
