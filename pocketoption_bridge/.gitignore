@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+ssid.txt
+api_token.txt
+bridge.json
+pairs.json
+history-cache.json*
+bridge.log*
+need_auth.trigger
