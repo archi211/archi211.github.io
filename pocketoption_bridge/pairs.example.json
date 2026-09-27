@@ -1,0 +1,5 @@
+[
+  {"symbol": "EURUSD_otc", "category": "FOREX", "digits": 5},
+  {"symbol": "GBPUSD_otc", "category": "FOREX", "digits": 5},
+  {"symbol": "USDJPY_otc", "category": "FOREX", "digits": 3}
+]

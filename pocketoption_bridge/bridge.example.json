@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 5000,
+  "broker_url": "",
+  "request_spacing": 2,
+  "history_interval": 60,
+  "request_timeout": 12,
+  "stale_after": 180,
+  "max_candle_age": 180,
+  "connect_timeout": 30,
+  "auth_wait_timeout": 300,
+  "bas_trigger": false
+}
