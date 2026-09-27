@@ -7,6 +7,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 from websockets.legacy.client import connect as websocket_connect
 from websockets.legacy.server import serve
 
@@ -26,6 +28,18 @@ class HistoryShapeTests(unittest.TestCase):
 
     def test_two_field_tick_history_is_not_ohlc(self):
         self.assertEqual(server.parse_bars([[MINUTE // 1000, 1.1]], MINUTE + 30000), [])
+
+    def test_processed_candle_cannot_override_its_asset(self):
+        self.assertEqual(server.parse_bars([PROCESSED], MINUTE + 30000, symbol="GBPUSD_otc"), [])
+
+    def test_close_reason_is_not_logged(self):
+        private_reason = "offline-sensitive-close-message"
+        error = ConnectionClosedError(Close(1008, private_reason), None)
+        with self.assertLogs(server.LOG, level="WARNING") as captured:
+            server.safe_failure("Session failed", error)
+        text = "\n".join(captured.output)
+        self.assertIn("received_code=1008", text)
+        self.assertNotIn(private_reason, text)
 
     def test_binary_header_with_full_payload_attachment(self):
         decoder = server.EventDecoder()

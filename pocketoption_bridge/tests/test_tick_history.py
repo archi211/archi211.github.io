@@ -43,7 +43,8 @@ class TickHistoryParserTests(unittest.TestCase):
         return server.parse_tick_history(raw, NOW_MS, symbol=SYMBOL)
 
     def test_sorts_ticks_and_builds_only_closed_internal_minutes(self):
-        rows = self.parse(packet_ticks())
+        ticks = packet_ticks()
+        rows = self.parse(ticks[4:] + ticks[:4])
 
         self.assertEqual(rows, [
             [BASE_MS + MINUTE_MS, 1.12, 1.30, 1.12, 1.20],
@@ -138,7 +139,7 @@ class IndexedTickHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["asset"], SYMBOL)
         self.assertEqual(request["period"], 60)
         self.assertEqual(request["time"], NOW_MS // 1000)
-        self.assertEqual(request["offset"], 3600)
+        self.assertEqual(request["offset"], 1000)
         self.assertIs(type(request["index"]), int)
         result = store.klines(SYMBOL, 3_000, 0)
         self.assertEqual(result["data"], [
@@ -214,6 +215,49 @@ class IndexedTickHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, diagnostic_text)
         self.assertNotIn(AUTH_PACKET, diagnostic_text)
         self.assertNotIn(secret, json.dumps(session.last_history))
+
+    async def test_indexed_period_zero_accepts_explicit_ohlc(self):
+        session, store = make_session()
+        session.ws = FakeWebSocket(session, lambda request: {
+            "period": 0, "index": request["index"], "data": [{
+                "time": BASE_MS // 1000, "open": 1.1, "close": 1.2,
+                "high": 1.3, "low": 1.0,
+            }],
+        })
+        await session.snapshot(SYMBOL)
+        result = store.klines(SYMBOL, 3000, 0)
+        self.assertEqual(result["data"], [[BASE_MS, 1.1, 1.3, 1.0, 1.2]])
+        self.assertEqual(result["history_source"], "ohlc")
+
+    async def test_late_response_cannot_satisfy_another_pair(self):
+        session, store = make_session()
+        session.ws = FakeWebSocket(session, lambda request: {})
+        with self.assertRaises(TimeoutError):
+            await session.snapshot(SYMBOL)
+        old_index = json.loads(session.ws.sent[0][2:])[1]["index"]
+
+        def second_response(request):
+            session.handle_event("loadHistoryPeriod", {
+                "index": old_index, "period": 0, "data": packet_ticks(),
+            })
+            self.assertFalse(session.pending.future.done())
+            self.assertEqual(store.klines(SYMBOL, 3000, 0)["data"], [])
+            return {"index": request["index"], "period": 0,
+                    "data": [{**row, "asset": OTHER_SYMBOL} for row in packet_ticks()]}
+
+        session.ws = FakeWebSocket(session, second_response)
+        await session.snapshot(OTHER_SYMBOL)
+        self.assertEqual(len(store.klines(OTHER_SYMBOL, 3000, 0)["data"]), 2)
+        self.assertEqual(store.klines(SYMBOL, 3000, 0)["data"], [])
+
+    async def test_stream_ticks_do_not_become_history_even_with_matching_index(self):
+        session, store = make_session()
+        session.pending = server.PendingHistory(SYMBOL, 123, asyncio.get_running_loop().create_future())
+        session.handle_event("updateStream", {
+            "asset": SYMBOL, "period": 0, "index": 123, "data": packet_ticks(),
+        })
+        self.assertFalse(session.pending.future.done())
+        self.assertEqual(store.klines(SYMBOL, 3000, 0)["data"], [])
 
 
 if __name__ == "__main__":

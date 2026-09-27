@@ -397,7 +397,7 @@ class BrokerSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request_event, "loadHistoryPeriod")
                 self.assertEqual(request_data["asset"], "EURUSD_otc")
                 self.assertEqual(request_data["period"], 60)
-                self.assertEqual(request_data["offset"], 3600)
+                self.assertEqual(request_data["offset"], 1000)
                 self.assertEqual(request_data["time"], NOW_MS // 1000)
                 self.assertIs(type(request_data["index"]), int)
                 self.assertEqual(store.pairs["EURUSD_otc"].bars[BASE_MINUTE_MS],

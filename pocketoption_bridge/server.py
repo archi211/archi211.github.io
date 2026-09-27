@@ -603,8 +603,14 @@ class BrokerSession:
             if not indexed or event not in ("loadHistoryPeriod", "raw"):
                 self.ignore_history("uncorrelated_tick_history")
                 return
-            bars = parse_tick_history(raw, now_ms, symbol=symbol)
-            source = "historical_ticks"
+            if isinstance(raw, list) and raw and all(
+                isinstance(row, dict) and all(k in row for k in ("open", "high", "low", "close"))
+                for row in raw
+            ):
+                bars = parse_bars(raw, now_ms, symbol=symbol)
+            else:
+                bars = parse_tick_history(raw, now_ms, symbol=symbol)
+                source = "historical_ticks"
         else:
             bars = parse_bars(raw, now_ms, symbol=symbol)
         if not self.store.merge_snapshot(symbol, bars, source=source):
@@ -623,7 +629,7 @@ class BrokerSession:
         self.pending = PendingHistory(symbol, self.next_index, future)
         try:
             payload = {"asset": symbol, "period": 60, "time": int(self.store.wall()),
-                       "offset": 3600, "index": self.pending.index}
+                       "offset": 1000, "index": self.pending.index}
             await self.ws.send("42" + json.dumps(["loadHistoryPeriod", payload], separators=(",", ":")))
             await asyncio.wait_for(future, self.settings.request_timeout)
         except TimeoutError:
