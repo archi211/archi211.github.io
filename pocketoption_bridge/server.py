@@ -28,9 +28,11 @@ from websockets.legacy.client import connect
 
 BASE = Path(__file__).resolve().parent
 LOG = logging.getLogger("bridge")
-BRIDGE_VERSION = "2.1.0"
+BRIDGE_VERSION = "2.1.1"
 MAX_BARS = 3000
 SYMBOL = re.compile(r"^[A-Za-z0-9_#.-]{1,20}_[oO][tT][cC]$")
+HISTORY_EVENTS = ("loadHistoryPeriod", "loadHistoryPeriodFast", "updateHistoryNew")
+MARKET_EVENTS = ("raw", "updateStream", *HISTORY_EVENTS)
 
 
 class ProtocolError(Exception):
@@ -392,17 +394,26 @@ class EventDecoder:
         self.pending = None
         self.parts = []
         self.expected = 0
+        self.stats = dict(binary_headers=0, binary_payloads=0, placeholder_events=0,
+                          unreferenced_attachments=0, raw_json_text=0, other_text=0)
+        self.last_binary = {}
 
     def feed(self, frame: str | bytes) -> list[tuple[str, object]]:
         try:
             if isinstance(frame, bytes):
+                self.stats["binary_payloads"] += 1
                 value = json.loads(frame.decode("utf-8"))
+                self.last_binary = history_shape("raw", value)
                 if self.pending is None:
                     return [("raw", value)]
                 self.parts.append(value)
                 if len(self.parts) < self.expected:
                     return []
-                event = self.replace(self.pending)
+                used = set()
+                event = self.replace(self.pending, used)
+                self.stats["unreferenced_attachments"] += self.expected - len(used)
+                if used:
+                    self.stats["placeholder_events"] += 1
                 self.pending, self.parts, self.expected = None, [], 0
                 return self.event(event)
             if frame.startswith("45"):
@@ -410,23 +421,29 @@ class EventDecoder:
                 if self.pending is not None or not count.isdigit() or not 1 <= int(count) <= 8:
                     raise ProtocolError("Invalid binary event")
                 self.pending, self.expected, self.parts = json.loads(data), int(count), []
+                self.stats["binary_headers"] += 1
                 return []
             if frame.startswith("42"):
                 return self.event(json.loads(frame[2:]))
+            if frame.lstrip().startswith(("{", "[")):
+                self.stats["raw_json_text"] += 1
+                return [("raw", json.loads(frame))]
+            self.stats["other_text"] += 1
             return []
         except (ValueError, UnicodeError, TypeError, IndexError, KeyError, RecursionError):
             raise ProtocolError("Unsupported event payload") from None
 
-    def replace(self, obj):
+    def replace(self, obj, used):
         if isinstance(obj, dict):
             if obj.get("_placeholder") is True:
                 index = obj.get("num")
                 if type(index) is not int or not 0 <= index < len(self.parts):
                     raise ProtocolError("Invalid binary placeholder")
+                used.add(index)
                 return self.parts[index]
-            return {key: self.replace(value) for key, value in obj.items()}
+            return {key: self.replace(value, used) for key, value in obj.items()}
         if isinstance(obj, list):
-            return [self.replace(value) for value in obj]
+            return [self.replace(value, used) for value in obj]
         return obj
 
     @staticmethod
@@ -445,8 +462,7 @@ class PendingHistory:
 
 def history_shape(event: str, payload: object) -> dict:
     """Only fixed names and container types; never payload values or unknown keys."""
-    safe_events = {"raw", "loadHistoryPeriod", "updateHistoryNew", "updateStream"}
-    summary = {"event": event if event in safe_events else "other", "type": type(payload).__name__}
+    summary = {"event": event if event in MARKET_EVENTS else "other", "type": type(payload).__name__}
     if isinstance(payload, dict):
         fields = ("asset", "period", "index", "candles", "data", "history")
         summary["fields"] = {key: type(payload[key]).__name__ for key in fields if key in payload}
@@ -464,6 +480,13 @@ def history_shape(event: str, payload: object) -> dict:
                         summary["row_fields"] = [k for k in ("asset", "symbol_id", "time", "timestamp",
                                                             "open", "close", "high", "low", "price") if k in row]
                 break
+    elif isinstance(payload, list):
+        summary["rows"] = len(payload)
+        if payload:
+            summary["row_type"] = type(payload[0]).__name__
+            if isinstance(payload[0], list):
+                summary["row_width"] = len(payload[0])
+                summary["row_types"] = [type(value).__name__ for value in payload[0][:8]]
     return summary
 
 
@@ -486,10 +509,15 @@ class BrokerSession:
                           history_packets=0, valid_bars=0, ignored_history=0)
         self.last_history = {}
         self.shape_logs = set()
+        self.event_counts = {}
+        self.event_shapes = {}
 
     def log_diagnostics(self, cause: str) -> None:
-        LOG.warning("Protocol diagnostics (%s): counters=%s last_history=%s", cause,
-                    json.dumps(self.stats, sort_keys=True), json.dumps(self.last_history, sort_keys=True))
+        LOG.warning("Protocol diagnostics (%s): counters=%s last_history=%s events=%s "
+                    "event_shapes=%s decoder=%s last_binary=%s", cause,
+                    json.dumps(self.stats, sort_keys=True), json.dumps(self.last_history, sort_keys=True),
+                    json.dumps(self.event_counts, sort_keys=True), json.dumps(self.event_shapes, sort_keys=True),
+                    json.dumps(self.decoder.stats, sort_keys=True), json.dumps(self.decoder.last_binary, sort_keys=True))
 
     def ignore_history(self, reason: str) -> None:
         self.stats["ignored_history"] += 1
@@ -551,6 +579,9 @@ class BrokerSession:
                 self.handle_event(event, payload)
 
     def handle_event(self, event: str, payload: object) -> None:
+        category = event if event in MARKET_EVENTS or event == "successauth" else "other"
+        self.event_counts[category] = self.event_counts.get(category, 0) + 1
+        self.event_shapes[category] = history_shape(event, payload)
         rejected = event.lower() in ("notauthorized", "auth_error", "errorauth")
         if event.lower() in ("auth", "error"):
             rejected = rejected or payload == "NotAuthorized"
@@ -566,8 +597,14 @@ class BrokerSession:
         if event == "successauth":
             self.authed.set()
             return
-        if event not in ("raw", "updateStream", "loadHistoryPeriod", "updateHistoryNew"):
+        if event not in MARKET_EVENTS:
             return
+        if event in HISTORY_EVENTS:
+            self.stats["history_packets"] += 1
+            self.last_history = history_shape(event, payload)
+            if not isinstance(payload, dict):
+                self.ignore_history("unsupported_history_envelope")
+                return
         if isinstance(payload, list):
             self.store.ticks(payload)
             return
@@ -575,8 +612,9 @@ class BrokerSession:
             return
         if event in ("raw", "updateStream") and not any(k in payload for k in ("candles", "data", "history")):
             return
-        self.stats["history_packets"] += 1
-        self.last_history = history_shape(event, payload)
+        if event not in HISTORY_EVENTS:
+            self.stats["history_packets"] += 1
+            self.last_history = history_shape(event, payload)
         symbol, period = payload.get("asset"), payload.get("period")
         pending = self.pending
         indexed = "index" in payload
@@ -600,7 +638,7 @@ class BrokerSession:
         now_ms = int(self.store.wall() * 1000)
         source = "ohlc"
         if period == 0:
-            if not indexed or event not in ("loadHistoryPeriod", "raw"):
+            if not indexed or event not in ("loadHistoryPeriod", "loadHistoryPeriodFast", "raw"):
                 self.ignore_history("uncorrelated_tick_history")
                 return
             if isinstance(raw, list) and raw and all(

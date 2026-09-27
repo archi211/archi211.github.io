@@ -49,7 +49,7 @@ class HistoryShapeTests(unittest.TestCase):
 
 
 class HistoryNetworkTests(unittest.IsolatedAsyncioTestCase):
-    async def test_three_pairs_indexed_binary_history_reaches_http(self):
+    async def test_three_pairs_standard_fast_and_raw_history_reaches_http(self):
         symbols = ["EURUSD_otc", "GBPUSD_otc", "USDJPY_otc"]
         now_ms = MINUTE + 210000
         store = server.Store(server.Settings(), [
@@ -78,8 +78,12 @@ class HistoryNetworkTests(unittest.IsolatedAsyncioTestCase):
                              for offset, price in [(10000, 1.0), (65000, 1.1), (90000, 1.2),
                                                    (125000, 1.3), (150000, 1.1), (190000, 1.4)]]
                     payload = {"asset": "", "index": request["index"], "period": 0, "data": ticks}
-                await ws.send('451-["loadHistoryPeriod",{"_placeholder":true,"num":0}]')
-                await ws.send(json.dumps(payload).encode())
+                if symbol == symbols[2]:
+                    await ws.send(json.dumps(payload))
+                else:
+                    response_event = "loadHistoryPeriod" if symbol == symbols[0] else "loadHistoryPeriodFast"
+                    await ws.send('451-' + json.dumps([response_event, {"_placeholder": True, "num": 0}]))
+                    await ws.send(json.dumps(payload).encode())
             await ws.wait_closed()
 
         async with serve(broker, "127.0.0.1", 0, ping_interval=None) as listener:
@@ -91,7 +95,7 @@ class HistoryNetworkTests(unittest.IsolatedAsyncioTestCase):
                 return await websocket_connect(uri, **kwargs)
 
             session = server.BrokerSession(server.Settings(), store,
-                '42["auth",{"session":"offline-only","isDemo":1}]')
+                '42["auth",{"session":"offline-only","isDemo":1,"isFastHistory":true}]')
             session.url = url
             with patch.object(server, "connect", new=local_connect):
                 try:
