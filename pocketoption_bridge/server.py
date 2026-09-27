@@ -604,7 +604,8 @@ class BrokerSession:
                 self.ignore_history("uncorrelated_tick_history")
                 return
             if isinstance(raw, list) and raw and all(
-                isinstance(row, dict) and all(k in row for k in ("open", "high", "low", "close"))
+                (isinstance(row, dict) and all(k in row for k in ("open", "high", "low", "close")))
+                or (isinstance(row, list) and len(row) in (5, 6, 7))
                 for row in raw
             ):
                 bars = parse_bars(raw, now_ms, symbol=symbol)

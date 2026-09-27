@@ -217,17 +217,21 @@ class IndexedTickHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, json.dumps(session.last_history))
 
     async def test_indexed_period_zero_accepts_explicit_ohlc(self):
-        session, store = make_session()
-        session.ws = FakeWebSocket(session, lambda request: {
-            "period": 0, "index": request["index"], "data": [{
-                "time": BASE_MS // 1000, "open": 1.1, "close": 1.2,
-                "high": 1.3, "low": 1.0,
-            }],
-        })
-        await session.snapshot(SYMBOL)
-        result = store.klines(SYMBOL, 3000, 0)
-        self.assertEqual(result["data"], [[BASE_MS, 1.1, 1.3, 1.0, 1.2]])
-        self.assertEqual(result["history_source"], "ohlc")
+        for row in (
+            {"time": BASE_MS // 1000, "open": 1.1, "close": 1.2, "high": 1.3, "low": 1.0},
+            [BASE_MS // 1000, 1.1, 1.2, 1.3, 1.0],
+            [BASE_MS // 1000, 1.1, 1.2, 1.3, 1.0, 100],
+            [66, BASE_MS // 1000, 1.1, 1.2, 1.3, 1.0, SYMBOL],
+        ):
+            with self.subTest(row=row):
+                session, store = make_session()
+                session.ws = FakeWebSocket(session, lambda request: {
+                    "period": 0, "index": request["index"], "data": [row],
+                })
+                await session.snapshot(SYMBOL)
+                result = store.klines(SYMBOL, 3000, 0)
+                self.assertEqual(result["data"], [[BASE_MS, 1.1, 1.3, 1.0, 1.2]])
+                self.assertEqual(result["history_source"], "ohlc")
 
     async def test_late_response_cannot_satisfy_another_pair(self):
         session, store = make_session()
