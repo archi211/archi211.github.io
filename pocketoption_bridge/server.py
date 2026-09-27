@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 from dataclasses import dataclass, field
 import hmac
 import json
@@ -17,7 +18,9 @@ import signal
 import ssl
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import uuid
 
 from flask import Flask, jsonify, request
@@ -28,10 +31,10 @@ from websockets.legacy.client import connect
 
 BASE = Path(__file__).resolve().parent
 LOG = logging.getLogger("bridge")
-BRIDGE_VERSION = "2.1.1"
+BRIDGE_VERSION = "2.1.2"
 MAX_BARS = 3000
 SYMBOL = re.compile(r"^[A-Za-z0-9_#.-]{1,20}_[oO][tT][cC]$")
-HISTORY_EVENTS = ("loadHistoryPeriod", "loadHistoryPeriodFast", "updateHistoryNew")
+HISTORY_EVENTS = ("loadHistoryPeriod", "loadHistoryPeriodFast", "updateHistoryNew", "updateHistoryNewFast")
 MARKET_EVENTS = ("raw", "updateStream", *HISTORY_EVENTS)
 
 
@@ -351,7 +354,9 @@ class Store:
             return {"protocol": 2, "version": BRIDGE_VERSION, "run_id": self.run_id, "epoch": self.epoch,
                     "status": self._status(), "data": [
                         {**s.metadata, "status": self._pair_status(s), "error": s.error,
-                         "bars": len(s.bars), "history_source": s.history_source}
+                         "bars": len(s.bars), "history_source": s.history_source,
+                         "latest_bar_ms": max(s.bars) if s.bars else None,
+                         "latest_bar_age_seconds": round(self.wall() - max(s.bars) / 1000, 1) if s.bars else None}
                         for s in self.pairs.values()]}
 
     def klines(self, symbol: str, limit: int, since: int) -> dict:
@@ -528,9 +533,10 @@ class BrokerSession:
             LOG.warning("History response ignored: %s", shape)
 
     async def open(self) -> None:
+        # Engine.IO supplies heartbeat; a second Ping/Pong timer can close a healthy session.
         self.ws = await connect(
             self.url, ssl=ssl.create_default_context(), origin="https://pocketoption.com",
-            open_timeout=self.settings.connect_timeout, ping_interval=20, ping_timeout=30,
+            open_timeout=self.settings.connect_timeout, ping_interval=None,
             close_timeout=5, max_size=4 * 1024 * 1024, max_queue=32,
             logger=logging.getLogger("bridge.transport"),
         )
@@ -552,8 +558,12 @@ class BrokerSession:
             await asyncio.gather(auth_waiter, return_exceptions=True)
 
     async def receive(self) -> None:
+        deadline = time.monotonic() + self.receive_timeout
         while True:
-            frame = await asyncio.wait_for(self.ws.recv(), self.receive_timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Engine.IO heartbeat expired")
+            frame = await asyncio.wait_for(self.ws.recv(), remaining)
             self.stats["binary_frames" if isinstance(frame, bytes) else "text_frames"] += 1
             if isinstance(frame, str):
                 if frame.startswith("0"):
@@ -562,12 +572,14 @@ class BrokerSession:
                     if not math.isfinite(timeout) or not 1 <= timeout <= 180:
                         raise ProtocolError("Invalid heartbeat settings")
                     self.receive_timeout = timeout + 5
+                    deadline = time.monotonic() + self.receive_timeout
                     await self.ws.send("40")
                     continue
                 if frame.startswith("2"):
                     self.stats["engine_pings"] += 1
                     await self.ws.send("3" + frame[1:])
                     self.stats["engine_pongs"] += 1
+                    deadline = time.monotonic() + self.receive_timeout
                     continue
                 if frame.startswith("40") and not self.auth_sent:
                     self.auth_sent = True
@@ -621,6 +633,9 @@ class BrokerSession:
         if indexed:
             index = payload["index"]
             if type(index) is not int or pending is None or index != pending.index:
+                self.last_history["request_active"] = pending is not None
+                if type(index) is int and pending is not None:
+                    self.last_history["index_relation"] = "older" if index < pending.index else "newer"
                 self.ignore_history("unmatched_index")
                 return
             if symbol in (None, ""):
@@ -904,6 +919,48 @@ def create_app(store: Store, token: str = "") -> Flask:
     return app
 
 
+def check_local_api() -> int:
+    """Inspect the running local bridge without exposing authentication files."""
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    try:
+        settings = Settings.load(BASE / "bridge.json")
+        token = read_secret(BASE / "api_token.txt")
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        host = "[::1]" if settings.host == "::1" else "127.0.0.1"
+        origin = f"http://{host}:{settings.port}"
+        opener = build_opener(ProxyHandler({}), NoRedirect())
+
+        def get(path):
+            with opener.open(Request(origin + path, headers=headers), timeout=5) as response:
+                return json.loads(response.read(1_000_001))
+
+        health = get("/healthz")
+        statuses = {"CONNECTING", "AUTH_REQUIRED", "DISCONNECTED", "WAITING_DATA", "READY",
+                    "DEGRADED", "ACCESS_DENIED", "STOPPED", "WORKER_FAILED", "LIVE", "STALE", "LOADING"}
+        status = health.get("status")
+        report = {"local_http": "OK", "status": status if status in statuses else "UNKNOWN", "pairs": []}
+        for pair in load_pairs(BASE / "pairs.json"):
+            symbol = pair["symbol"]
+            payload = get("/v1/klines?" + urlencode({"symbol": symbol, "limit": 1}))
+            rows = payload.get("data", [])
+            latest = rows[-1] if isinstance(rows, list) and rows else None
+            valid = valid_bar(latest, int(time.time() * 1000))
+            status = payload.get("pair_status")
+            report["pairs"].append({"symbol": symbol, "status": status if status in statuses else "UNKNOWN",
+                                    "bar_available_over_http": valid,
+                                    "latest_bar_age_seconds": round(time.time() - latest[0] / 1000, 1) if valid else None})
+        print(json.dumps(report, indent=2))
+        return 0 if all(p["bar_available_over_http"] for p in report["pairs"]) else 1
+    except HTTPError as error:
+        print(f"Local bridge HTTP {error.code}; check the running server and local API token")
+    except Exception as error:
+        print(f"Local bridge check failed ({type(error).__name__}); check configuration and server")
+    return 1
+
+
 def main() -> None:
     os.umask(0o077)
     handler = RotatingFileHandler(BASE / "bridge.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
@@ -959,4 +1016,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Check the running local HTTP API without printing secrets")
+    if parser.parse_args().check:
+        raise SystemExit(check_local_api())
     main()

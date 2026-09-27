@@ -44,6 +44,34 @@ class EventRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.pending.future.done())
         self.assertEqual(len(store.klines(SYMBOL, 3000, 0)["data"]), 1)
 
+    async def test_fast_update_populates_labelled_m1_without_completing_request(self):
+        session, store = self.make_session()
+        self.route(session, [
+            '451-["updateHistoryNewFast",{"_placeholder":true,"num":0}]',
+            json.dumps({"asset": SYMBOL, "period": 60,
+                        "candles": [[MINUTE // 1000, 1.1, 1.2, 1.3, 1.0, 7]],
+                        "history": [[MINUTE // 1000, 1.15]]}).encode(),
+        ])
+        self.assertFalse(session.pending.future.done())
+        result = store.klines(SYMBOL, 3000, 0)
+        self.assertEqual(result["data"], [[MINUTE, 1.1, 1.3, 1.0, 1.2]])
+        self.assertEqual(result["pair_status"], "LIVE")
+        self.assertEqual(session.stats["history_packets"], 1)
+        health = server.create_app(store).test_client().get("/healthz").json
+        self.assertEqual(health["data"][0]["latest_bar_ms"], MINUTE)
+        self.assertEqual(health["data"][0]["latest_bar_age_seconds"], 30)
+
+    async def test_fast_update_requires_explicit_symbol_and_minute_ohlc(self):
+        for fields in ({"asset": None}, {"asset": "GBPUSD_otc"}, {"period": 5}, {"period": 0}):
+            with self.subTest(fields=fields):
+                session, store = self.make_session()
+                session.handle_event("updateHistoryNewFast", {
+                    "asset": SYMBOL, "period": 60, "candles": [[MINUTE // 1000, 1.1, 1.2, 1.3, 1.0, 7]],
+                    **fields,
+                })
+                self.assertEqual(store.klines(SYMBOL, 3000, 0)["data"], [])
+                self.assertFalse(session.pending.future.done())
+
     async def test_raw_text_history_with_matching_index(self):
         session, store = self.make_session()
         self.route(session, [json.dumps(history())])
@@ -57,6 +85,18 @@ class EventRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.route(session, ['42' + json.dumps(["loadHistoryPeriodFast", {**history(), **fields}])])
                 self.assertFalse(session.pending.future.done())
                 self.assertEqual(store.klines(SYMBOL, 3000, 0)["data"], [])
+
+    async def test_index_diagnostics_distinguish_no_request_and_mismatch_without_values(self):
+        session, _ = self.make_session()
+        session.handle_event("loadHistoryPeriodFast", history(index=122))
+        self.assertTrue(session.last_history["request_active"])
+        self.assertEqual(session.last_history["index_relation"], "older")
+        session.handle_event("loadHistoryPeriodFast", history(index=124))
+        self.assertEqual(session.last_history["index_relation"], "newer")
+        session.pending = None
+        session.handle_event("loadHistoryPeriodFast", history())
+        self.assertFalse(session.last_history["request_active"])
+        self.assertNotIn("index_relation", session.last_history)
 
     async def test_malformed_history_envelope_is_counted_and_rejected(self):
         session, store = self.make_session()
