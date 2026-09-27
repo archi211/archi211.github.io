@@ -22,12 +22,13 @@ import uuid
 
 from flask import Flask, jsonify, request
 from waitress import create_server
-from websockets.exceptions import InvalidStatusCode
+from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 from websockets.legacy.client import connect
 
 
 BASE = Path(__file__).resolve().parent
 LOG = logging.getLogger("bridge")
+BRIDGE_VERSION = "2.1.0"
 MAX_BARS = 3000
 SYMBOL = re.compile(r"^[A-Za-z0-9_#.-]{1,20}_[oO][tT][cC]$")
 
@@ -42,6 +43,13 @@ class AuthRequired(Exception):
 
 def safe_failure(action: str, error: BaseException) -> None:
     # Remote messages and exception strings can contain session credentials.
+    if isinstance(error, ConnectionClosed):
+        LOG.warning("%s (%s; received_code=%s; sent_code=%s; ping_timeout=%s)",
+                    action, type(error).__name__,
+                    error.rcvd.code if error.rcvd else None,
+                    error.sent.code if error.sent else None,
+                    bool(error.sent and error.sent.reason == "keepalive ping timeout"))
+        return
     LOG.warning("%s (%s)", action, type(error).__name__)
 
 
@@ -165,17 +173,23 @@ def valid_bar(row: object, now_ms: int) -> bool:
     )
 
 
-def parse_bars(raw: object, now_ms: int) -> list[list]:
+def parse_bars(raw: object, now_ms: int, *, symbol: str | None = None) -> list[list]:
     if not isinstance(raw, list):
         return []
     bars = {}
     for item in raw[-10000:]:
         try:
             if isinstance(item, dict):
+                if symbol is not None and item.get("asset", symbol) != symbol:
+                    continue
                 t = item.get("time", item.get("timestamp"))
                 o, h, low, close = (item[k] for k in ("open", "high", "low", "close"))
-            elif isinstance(item, list) and len(item) >= 5:
-                # PocketOption wire order is T,O,C,H,L; HTTP uses T,O,H,L,C.
+            elif isinstance(item, list) and len(item) == 7 and type(item[0]) is int and isinstance(item[6], str):
+                # ProcessedCandle: symbol_id,T,O,C,H,L,asset (not T,O,C,H,L).
+                _, t, o, close, h, low, asset = item
+                if symbol is not None and asset != symbol:
+                    continue
+            elif isinstance(item, list) and len(item) in (5, 6):
                 t, o, close, h, low = item[:5]
             else:
                 continue
@@ -189,6 +203,39 @@ def parse_bars(raw: object, now_ms: int) -> list[list]:
     return [bars[t] for t in sorted(bars)][-MAX_BARS:]
 
 
+def parse_tick_history(raw: object, now_ms: int, *, symbol: str) -> list[list]:
+    """Aggregate an indexed historical packet, excluding its partial boundaries."""
+    if not isinstance(raw, list) or not raw:
+        return []
+    ticks = []
+    for item in raw[-10000:]:
+        try:
+            if not isinstance(item, dict) or item.get("asset") not in (None, "", symbol):
+                return []
+            if any(key in item for key in ("open", "close", "high", "low")):
+                return []
+            t = timestamp_ms(item["time"])
+            if isinstance(item["price"], bool):
+                return []
+            price = float(item["price"])
+            if not 946684800000 <= t <= now_ms or not math.isfinite(price) or price <= 0:
+                return []
+            ticks.append((t, price))
+        except (ValueError, TypeError, KeyError, OverflowError):
+            return []
+    ticks.sort(key=lambda tick: tick[0])
+    first_minute = ticks[0][0] // 60000 * 60000
+    last_minute = ticks[-1][0] // 60000 * 60000
+    bars = {}
+    for t, price in ticks:
+        minute = t // 60000 * 60000
+        if not first_minute < minute < last_minute:
+            continue
+        row = bars.setdefault(minute, [minute, price, price, price, price])
+        row[2], row[3], row[4] = max(row[2], price), min(row[3], price), price
+    return list(bars.values())[-MAX_BARS:]
+
+
 @dataclass
 class PairState:
     metadata: dict
@@ -198,6 +245,7 @@ class PairState:
     snapshot_at: float = 0.0
     source_ms: int = 0
     error: str = ""
+    history_source: str = "unknown"
 
 
 class Store:
@@ -245,7 +293,7 @@ class Store:
         with self.lock:
             self.pairs[symbol].error = code
 
-    def merge_snapshot(self, symbol: str, bars: list[list]) -> bool:
+    def merge_snapshot(self, symbol: str, bars: list[list], *, source: str = "ohlc") -> bool:
         if not bars or symbol not in self.pairs:
             return False
         now_ms = int(self.wall() * 1000)
@@ -267,6 +315,7 @@ class Store:
                 state.snapshot_at = self.clock()
                 state.source_ms = max(state.source_ms, latest)
             state.error = ""
+            state.history_source = source
             return True
 
     def ticks(self, raw: object) -> None:
@@ -297,9 +346,10 @@ class Store:
 
     def pairs_payload(self) -> dict:
         with self.lock:
-            return {"protocol": 2, "run_id": self.run_id, "epoch": self.epoch,
+            return {"protocol": 2, "version": BRIDGE_VERSION, "run_id": self.run_id, "epoch": self.epoch,
                     "status": self._status(), "data": [
-                        {**s.metadata, "status": self._pair_status(s), "error": s.error}
+                        {**s.metadata, "status": self._pair_status(s), "error": s.error,
+                         "bars": len(s.bars), "history_source": s.history_source}
                         for s in self.pairs.values()]}
 
     def klines(self, symbol: str, limit: int, since: int) -> dict:
@@ -309,7 +359,7 @@ class Store:
             return {"protocol": 2, "run_id": self.run_id, "epoch": self.epoch,
                     "status": self._status(), "pair_status": self._pair_status(state),
                     "last_tick_ms": state.last_tick_ms or None, "data": rows,
-                    "history_complete": False, "error": state.error}
+                    "history_complete": False, "history_source": state.history_source, "error": state.error}
 
     def save(self, path: Path) -> None:
         with self.cache_lock:
@@ -330,6 +380,7 @@ class Store:
                     if symbol in self.pairs and isinstance(rows, list):
                         self.pairs[symbol].bars = dict(sorted({r[0]: r for r in rows
                             if valid_bar(r, int(self.wall() * 1000))}.items())[-MAX_BARS:])
+                        self.pairs[symbol].history_source = "cache"
         except (OSError, ValueError, TypeError, AttributeError) as error:
             safe_failure("Cache ignored", error)
 
@@ -385,6 +436,37 @@ class EventDecoder:
         return [(value[0], value[1] if len(value) > 1 else {})]
 
 
+@dataclass
+class PendingHistory:
+    symbol: str
+    index: int
+    future: asyncio.Future
+
+
+def history_shape(event: str, payload: object) -> dict:
+    """Only fixed names and container types; never payload values or unknown keys."""
+    safe_events = {"raw", "loadHistoryPeriod", "updateHistoryNew", "updateStream"}
+    summary = {"event": event if event in safe_events else "other", "type": type(payload).__name__}
+    if isinstance(payload, dict):
+        fields = ("asset", "period", "index", "candles", "data", "history")
+        summary["fields"] = {key: type(payload[key]).__name__ for key in fields if key in payload}
+        for key in ("candles", "data", "history"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                summary["rows"] = len(rows)
+                if rows:
+                    row = rows[0]
+                    summary["row_type"] = type(row).__name__
+                    if isinstance(row, list):
+                        summary["row_width"] = len(row)
+                        summary["row_types"] = [type(value).__name__ for value in row[:8]]
+                    elif isinstance(row, dict):
+                        summary["row_fields"] = [k for k in ("asset", "symbol_id", "time", "timestamp",
+                                                            "open", "close", "high", "low", "price") if k in row]
+                break
+    return summary
+
+
 class BrokerSession:
     def __init__(self, settings: Settings, store: Store, ssid: str):
         self.settings, self.store = settings, store
@@ -396,9 +478,26 @@ class BrokerSession:
         self.authed = asyncio.Event()
         self.auth_sent = False
         self.auth_error = False
-        self.pending = None
+        self.pending: PendingHistory | None = None
+        self.next_index = int(time.time() * 1000)
         self.decoder = EventDecoder()
         self.receive_timeout = 60.0
+        self.stats = dict(text_frames=0, binary_frames=0, engine_pings=0, engine_pongs=0,
+                          history_packets=0, valid_bars=0, ignored_history=0)
+        self.last_history = {}
+        self.shape_logs = set()
+
+    def log_diagnostics(self, cause: str) -> None:
+        LOG.warning("Protocol diagnostics (%s): counters=%s last_history=%s", cause,
+                    json.dumps(self.stats, sort_keys=True), json.dumps(self.last_history, sort_keys=True))
+
+    def ignore_history(self, reason: str) -> None:
+        self.stats["ignored_history"] += 1
+        self.last_history["reason"] = reason
+        shape = json.dumps(self.last_history, sort_keys=True)
+        if shape not in self.shape_logs and len(self.shape_logs) < 12:
+            self.shape_logs.add(shape)
+            LOG.warning("History response ignored: %s", shape)
 
     async def open(self) -> None:
         self.ws = await connect(
@@ -427,6 +526,7 @@ class BrokerSession:
     async def receive(self) -> None:
         while True:
             frame = await asyncio.wait_for(self.ws.recv(), self.receive_timeout)
+            self.stats["binary_frames" if isinstance(frame, bytes) else "text_frames"] += 1
             if isinstance(frame, str):
                 if frame.startswith("0"):
                     hello = json.loads(frame[1:])
@@ -437,7 +537,9 @@ class BrokerSession:
                     await self.ws.send("40")
                     continue
                 if frame.startswith("2"):
+                    self.stats["engine_pings"] += 1
                     await self.ws.send("3" + frame[1:])
+                    self.stats["engine_pongs"] += 1
                     continue
                 if frame.startswith("40") and not self.auth_sent:
                     self.auth_sent = True
@@ -458,8 +560,8 @@ class BrokerSession:
         if rejected:
             self.auth_error = True
             self.authed.set()
-            if self.pending and not self.pending[1].done():
-                self.pending[1].set_exception(AuthRequired("Broker rejected authentication"))
+            if self.pending and not self.pending.future.done():
+                self.pending.future.set_exception(AuthRequired("Broker rejected authentication"))
             return
         if event == "successauth":
             self.authed.set()
@@ -471,26 +573,62 @@ class BrokerSession:
             return
         if not isinstance(payload, dict):
             return
+        if event in ("raw", "updateStream") and not any(k in payload for k in ("candles", "data", "history")):
+            return
+        self.stats["history_packets"] += 1
+        self.last_history = history_shape(event, payload)
         symbol, period = payload.get("asset"), payload.get("period")
-        # Never assign an unlabelled/late response to the current requested pair.
-        if not isinstance(symbol, str) or symbol not in self.store.pairs or period != 60:
+        pending = self.pending
+        indexed = "index" in payload
+        if indexed:
+            index = payload["index"]
+            if type(index) is not int or pending is None or index != pending.index:
+                self.ignore_history("unmatched_index")
+                return
+            if symbol in (None, ""):
+                symbol = pending.symbol
+            elif symbol != pending.symbol:
+                self.ignore_history("index_asset_conflict")
+                return
+        if not isinstance(symbol, str) or symbol not in self.store.pairs:
+            self.ignore_history("unidentified_asset")
+            return
+        if type(period) is not int or period not in (0, 60):
+            self.ignore_history("not_m1")
             return
         raw = payload.get("candles", payload.get("data", payload.get("history")))
-        bars = parse_bars(raw, int(self.store.wall() * 1000))
-        if self.store.merge_snapshot(symbol, bars) and self.pending:
-            requested, future = self.pending
-            if requested == symbol and not future.done():
-                future.set_result(True)
+        now_ms = int(self.store.wall() * 1000)
+        source = "ohlc"
+        if period == 0:
+            if not indexed or event not in ("loadHistoryPeriod", "raw"):
+                self.ignore_history("uncorrelated_tick_history")
+                return
+            bars = parse_tick_history(raw, now_ms, symbol=symbol)
+            source = "historical_ticks"
+        else:
+            bars = parse_bars(raw, now_ms, symbol=symbol)
+        if not self.store.merge_snapshot(symbol, bars, source=source):
+            self.ignore_history("no_valid_ohlc")
+            return
+        self.stats["valid_bars"] += len(bars)
+        if pending and indexed and symbol == pending.symbol and not pending.future.done():
+            pending.future.set_result(True)
+            LOG.info("History loaded: %s; bars=%d; source=%s", symbol, len(bars), source)
 
     async def snapshot(self, symbol: str) -> None:
         if self.pending is not None:
             raise RuntimeError("Only one history request may be pending")
         future = asyncio.get_running_loop().create_future()
-        self.pending = (symbol, future)
+        self.next_index += 1
+        self.pending = PendingHistory(symbol, self.next_index, future)
         try:
-            await self.ws.send("42" + json.dumps(["changeSymbol", {"asset": symbol, "period": 60}],
-                                               separators=(",", ":")))
+            payload = {"asset": symbol, "period": 60, "time": int(self.store.wall()),
+                       "offset": 3600, "index": self.pending.index}
+            await self.ws.send("42" + json.dumps(["loadHistoryPeriod", payload], separators=(",", ":")))
             await asyncio.wait_for(future, self.settings.request_timeout)
+        except TimeoutError:
+            self.log_diagnostics("history_timeout")
+            raise
         finally:
             self.pending = None
             if not future.done():
@@ -505,8 +643,8 @@ class BrokerSession:
         if self.receiver:
             self.receiver.cancel()
             await asyncio.gather(self.receiver, return_exceptions=True)
-        if self.pending and not self.pending[1].done():
-            self.pending[1].cancel()
+        if self.pending and not self.pending.future.done():
+            self.pending.future.cancel()
         if self.ws:
             try:
                 await asyncio.wait_for(self.ws.close(), 6)
@@ -632,6 +770,8 @@ class Worker:
                     LOG.warning("WebSocket HTTP status=%d; reconnect postponed", error.status_code)
                 except Exception as error:
                     safe_failure("Session failed", error)
+                    if isinstance(session, BrokerSession):
+                        session.log_diagnostics("session_failed")
                 finally:
                     self.store.set_connection("DISCONNECTED")
                     for task in tasks:
@@ -759,7 +899,8 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
-    LOG.info("HTTP listening on %s:%s; configured pairs=%d", settings.host, settings.port, len(store.pairs))
+    LOG.info("Bridge %s; HTTP listening on %s:%s; configured pairs=%d",
+             BRIDGE_VERSION, settings.host, settings.port, len(store.pairs))
     try:
         server.run()
     except KeyboardInterrupt:

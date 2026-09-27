@@ -348,6 +348,7 @@ class BrokerSessionTests(unittest.IsolatedAsyncioTestCase):
             await ws.send("2test-heartbeat")
             received["heartbeat"].append(await ws.recv())
             received["request"].append(await ws.recv())
+            history_request = json.loads(received["request"][0][2:])[1]
 
             valid = [[BASE_MINUTE_MS // 1000, 1.1, 1.16, 1.23, 1.02]]
             await ws.send('42["loadHistoryPeriod",' + json.dumps({
@@ -361,7 +362,7 @@ class BrokerSessionTests(unittest.IsolatedAsyncioTestCase):
             await release_valid_snapshot.wait()
             await ws.send(
                 '451-["loadHistoryPeriod",{"asset":"EURUSD_otc","period":60,'
-                '"candles":{"_placeholder":true,"num":0}}]'
+                '"index":' + str(history_request["index"]) + ',"candles":{"_placeholder":true,"num":0}}]'
             )
             await ws.send(json.dumps(valid, separators=(",", ":")).encode())
             try:
@@ -392,9 +393,13 @@ class BrokerSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(received["namespace"], ["40"])
                 self.assertEqual(received["auth"], [TEST_SSID])
                 self.assertEqual(received["heartbeat"], ["3test-heartbeat"])
-                self.assertEqual(received["request"], [
-                    '42["changeSymbol",{"asset":"EURUSD_otc","period":60}]'
-                ])
+                request_event, request_data = json.loads(received["request"][0][2:])
+                self.assertEqual(request_event, "loadHistoryPeriod")
+                self.assertEqual(request_data["asset"], "EURUSD_otc")
+                self.assertEqual(request_data["period"], 60)
+                self.assertEqual(request_data["offset"], 3600)
+                self.assertEqual(request_data["time"], NOW_MS // 1000)
+                self.assertIs(type(request_data["index"]), int)
                 self.assertEqual(store.pairs["EURUSD_otc"].bars[BASE_MINUTE_MS],
                                  [BASE_MINUTE_MS, 1.1, 1.23, 1.02, 1.16])
                 self.assertIn(BASE_MINUTE_MS, store.pairs["GBPUSD_otc"].bars)
